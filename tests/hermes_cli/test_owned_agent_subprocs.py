@@ -12,7 +12,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import psutil
@@ -194,8 +193,6 @@ def _reap(proc: subprocess.Popen) -> None:
 
 @pytest.mark.asyncio
 async def test_whatsapp_disconnect_releases_the_bridge_it_stopped(monkeypatch):
-    from plugins.platforms.whatsapp import adapter as wa
-
     released = []
     monkeypatch.setattr(process_identity, "release_process_groups", lambda pgids: released.append(list(pgids)))
     bridge = _sleeper()
@@ -269,8 +266,15 @@ def test_a_stopped_bridge_whose_child_survived_stays_covered(monkeypatch, tmp_pa
     releasing that group would let the helper outlive a later kill -9 of this process."""
     from plugins.platforms.raft import adapter as raft
 
-    released = []
+    released, release_timeouts = [], []
     monkeypatch.setattr(process_identity, "release_process_groups", lambda pgids: released.append(list(pgids)))
+    real_release = raft.release_process_group_once_empty
+
+    def recording_release(pgid, **kwargs):
+        release_timeouts.append(kwargs.get("timeout"))
+        return real_release(pgid, **kwargs)
+
+    monkeypatch.setattr(raft, "release_process_group_once_empty", recording_release)
     receipt = tmp_path / "helper.pid"
     bridge = subprocess.Popen(  # detached-spawn: ok — test bridge stand-in; its group is killed in finally
         ["sh", "-c", f"(trap '' TERM; echo $(exec sh -c 'echo $PPID') > {receipt}; exec sleep 60) & exec sleep 60"],
@@ -279,11 +283,10 @@ def test_a_stopped_bridge_whose_child_survived_stays_covered(monkeypatch, tmp_pa
     a._bridge_process = bridge
     try:
         wait_until(receipt.exists, what="helper receipt")
-        started = time.monotonic()
         a._stop_bridge()
-        # disconnect() runs this on the event loop: the live helper must not make it sleep out the
-        # release wait (it took a full second with the default timeout).
-        assert time.monotonic() - started < 0.8, "_stop_bridge() blocked on the surviving helper"
+        # disconnect() runs this on the event loop: the release must probe once (timeout=0), not
+        # sleep out the default wait on the surviving helper.
+        assert release_timeouts == [0], "_stop_bridge() would block the event loop on the surviving helper"
         assert bridge.poll() is not None, "_stop_bridge() left the bridge running"
         assert released == [], "a group with a live helper was released from the owner-death supervisor"
     finally:

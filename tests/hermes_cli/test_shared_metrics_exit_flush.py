@@ -153,7 +153,7 @@ def test_sigtermed_kanban_worker_writes_the_open_sessions_summary(metrics_home, 
     assert "hermes.session.count" in _metric_names(home)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="the legacy parent watchdog is POSIX-only")
+@pytest.mark.platforms("posix")  # the legacy parent watchdog is POSIX-only
 def test_orphaned_slash_worker_writes_the_open_sessions_summary(metrics_home, monkeypatch):
     from tui_gateway import slash_worker
 
