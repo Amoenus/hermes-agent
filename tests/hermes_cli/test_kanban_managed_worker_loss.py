@@ -1,19 +1,9 @@
 """A lost managed worker must be DISPOSED OF on the board, within one dispatcher tick.
 
-Regression for the 2026-10-22 stall (card ``t_f5fad63f``, run 730). The fan gateway's managed
-worker died 24 s into the attempt, inside the ``worker.adopt`` handshake
-(``TimeoutError: timed out while waiting for handshake response``, ``open_timeout=5``). The
-gateway logged ``Managed worker lost: managed_worker_failed``, settled the admission
-``terminal/interrupted`` — and the card went on saying ``running`` for 49 minutes:
-
-  * ``tasks.claim_expires`` was 2067 s in the past and ``last_heartbeat_at`` was NULL;
-  * every recorded worker pid was dead;
-  * ``consecutive_failures`` stayed 0, so the ``failure_limit`` breaker never applied;
-  * ``release_stale_claims`` and ``detect_crashed_workers`` both declined: the owner receipt
-    was "ambiguous", and ``owner_attempt_provably_over`` required the OWNER PROCESS to be
-    gone — but the owner is the live gateway. Only a human ``reclaim`` ended it.
-
-These tests pin the disposition the dispatcher owes every lost attempt:
+Regression for a card that stayed ``running`` for 49 minutes after its managed worker died in
+the ``worker.adopt`` handshake (claim long expired, every recorded pid dead, the owner gateway
+alive and its admission settled ``terminal/interrupted``). These tests pin the disposition the
+dispatcher owes every lost attempt:
 
   A1  a killed worker under a live claim is booked ``crashed`` within one tick;
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
@@ -81,7 +71,7 @@ class _Board:
         claim_expires_in: int = 900, heartbeat_age=None, owner: bool = True,
         admission=("terminal", "interrupted"), worker_lost=None, dead_seconds: int = 120,
     ) -> int:
-        """A ``running`` card whose worker died the way run 730's did."""
+        """A ``running`` card whose managed worker was lost."""
         worker_pid = _absent_pid() if worker_pid is None else int(worker_pid)
         lock = f"{HOST}:{_absent_pid(base=3_900_000)}"
         started = NOW - dead_seconds
@@ -216,7 +206,7 @@ def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape):
 
 
 def test_the_incident_shape_names_the_loss_on_the_reclaim(board):
-    """Run 730's exact shape, behind a settled receipt: the reclaim says what happened."""
+    """The incident shape behind a settled receipt: the reclaim says what happened."""
     run_id = board.running("t_730", claim_expires_in=-2067, owner=True,
                            worker_lost="managed_worker_failed")
     board.tick(failure_limit=2)

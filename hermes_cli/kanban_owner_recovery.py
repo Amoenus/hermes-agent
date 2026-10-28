@@ -205,6 +205,36 @@ def owner_attempt_note(conn, task_id) -> str:
     return ""
 
 
+def reclaim_error(conn, task_id, claim_lock) -> str:
+    """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
+    note = owner_attempt_note(conn, task_id)
+    return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
+
+
+def apply_attempt_note(conn, task_id, pid, dead) -> None:
+    """Fold the owner's own record of how the attempt ended into ONE dead worker's booking.
+
+    A managed worker that dies in ``worker.adopt`` writes no ``worker_result``, so its rc=0
+    exit trailer reads as a protocol violation. The owner's ``worker_lost`` evidence outranks
+    it: the turn never finished, so it books as a crash and charges the breaker, and the
+    protocol-violation streak (which reads the persisted payload) does not count it.
+    """
+    note = owner_attempt_note(conn, task_id)
+    if not note:
+        return
+    dead.error_text = f"{dead.error_text} [{note}]"
+    dead.event_payload["attempt_note"] = note
+    lost = _latest_run_event(conn, task_id, "worker_lost")
+    if lost:
+        dead.event_payload["worker_lost"] = lost
+        if dead.protocol_violation:
+            dead.protocol_violation = False
+            dead.event_payload.pop("protocol_violation", None)
+            dead.event_payload["exit_kind"] = dead.kind
+            dead.event_kind = "crashed"
+            dead.error_text = f"pid {pid} exited cleanly after its managed worker was lost [{note}]"
+
+
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
     """True when a reclaim path must leave this task alone.
 
