@@ -1,9 +1,9 @@
 """A lost managed worker must be DISPOSED OF on the board, within one dispatcher tick.
 
-Regression for a card that stayed ``running`` for 49 minutes after its managed worker died in
-the ``worker.adopt`` handshake (claim long expired, every recorded pid dead, the owner gateway
-alive and its admission settled ``terminal/interrupted``). These tests pin the disposition the
-dispatcher owes every lost attempt:
+Regression for a card left ``running`` after its managed worker died in the ``worker.adopt``
+handshake (claim expired, every recorded pid dead, the owner gateway alive and its admission
+settled ``terminal/interrupted``). These tests pin the disposition the dispatcher owes every
+lost attempt:
 
   A1  a killed worker under a live claim is booked ``crashed`` within one tick;
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
@@ -30,6 +30,7 @@ from hermes_cli import kanban_owner_recovery
 NOW = int(time.time())
 HOST = kb._claimer_id().split(":", 1)[0]
 FINGERPRINT = "6a232414-2dbf-40ab-a534-d9b71db05658:116|4162240"
+CLAIM_LAPSED = -1800  # claim_expires_in for a claim that expired half an hour ago
 
 
 def _absent_pid(base: int = 3_800_000) -> int:
@@ -70,6 +71,7 @@ class _Board:
         self, tid: str = "t_lost", *, worker_pid=None, record_worker_pid: bool = True,
         claim_expires_in: int = 900, heartbeat_age=None, owner: bool = True,
         admission=("terminal", "interrupted"), worker_lost=None, dead_seconds: int = 120,
+        owner_pid=None,
     ) -> int:
         """A ``running`` card whose managed worker was lost."""
         worker_pid = _absent_pid() if worker_pid is None else int(worker_pid)
@@ -89,13 +91,13 @@ class _Board:
              FINGERPRINT if record_worker_pid else None,
              (NOW - heartbeat_age) if heartbeat_age is not None else None, run_id, started),
         )
-        self.event(tid, run_id, "claimed", {"lock": lock, "expires": NOW - claim_expires_in * 0}, started)
+        self.event(tid, run_id, "claimed", {"lock": lock, "expires": NOW + claim_expires_in}, started)
         self.event(tid, run_id, "spawned",
                    {"pid": worker_pid, "started_at": FINGERPRINT} if record_worker_pid else {}, started)
         if owner:
             request_id = f'kanban:["default","{tid}",{run_id}]'
             self.event(tid, run_id, "owner_admitted",
-                       {"db": str(self.ledger), "session_id": "sess-1", "pid": _absent_pid(base=3_950_000),
+                       {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid or _absent_pid(base=3_950_000),
                         "request_id": request_id}, started + 3)
             if admission:
                 with sqlite3.connect(self.ledger) as store:
@@ -172,11 +174,16 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     log = kb.worker_log_path("t_clean")
     log.parent.mkdir(parents=True, exist_ok=True)
     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
-    log.write_text(f"{KANBAN_WORKER_EXIT_TRAILER}0\n", encoding="utf-8")
+    log.write_text(f"I fixed the protocol violation from the last run.\n{KANBAN_WORKER_EXIT_TRAILER}0\n",
+                   encoding="utf-8")
     board.tick(failure_limit=2)
     run = board.run(run_id)
     assert run["outcome"] == "crashed"
     assert "managed worker lost" in run["error"]
+    assert run["error"].startswith("pid ") and "exited cleanly after its managed worker was lost." in run["error"]
+    assert "I fixed the protocol violation" in run["error"]  # the worker's own output is kept
+    assert run["error"].index("[managed worker lost") < run["error"].index("Worker's last output")
+    assert "without kanban_complete" not in run["error"]
     assert board.state("t_clean")["consecutive_failures"] == 1
     # Not a protocol violation as well: one loss is charged to one budget.
     assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
@@ -188,36 +195,27 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
 
 # --- A2: an elapsed claim lock is never "still running" after one tick ---------------------
 
-@pytest.mark.parametrize("shape", [
-    dict(record_worker_pid=False, owner=False),                       # no pid, no owner at all
-    dict(record_worker_pid=False, owner=True),                        # no pid, settled receipt
-    dict(owner=False),                                                # dead pid, no owner
-    dict(owner=True, worker_lost="managed_worker_failed"),            # the incident shape
+@pytest.mark.parametrize("shape, error", [
+    (dict(record_worker_pid=False, owner=False), "stale_lock="),
+    (dict(record_worker_pid=False, owner=True), "owner admission settled interrupted"),
+    (dict(owner=False), "stale_lock="),
+    (dict(owner=True, worker_lost="managed_worker_failed"), "managed worker lost: managed_worker_failed"),
 ], ids=["no-pid", "no-pid-receipt", "dead-pid", "dead-pid-lost"])
-def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape):
-    run_id = board.running("t_lapsed", claim_expires_in=-2067, heartbeat_age=None, **shape)
+def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error):
+    run_id = board.running("t_lapsed", claim_expires_in=CLAIM_LAPSED, heartbeat_age=None, **shape)
     board.tick(failure_limit=2)
     row, run = board.state("t_lapsed"), board.run(run_id)
-    assert row["status"] != "running"
     assert row["status"] == "ready"
-    assert run["outcome"] in {"crashed", "reclaimed"}
-    assert run["error"]
-    assert row["consecutive_failures"] == 1
-
-
-def test_the_incident_shape_names_the_loss_on_the_reclaim(board):
-    """The incident shape behind a settled receipt: the reclaim says what happened."""
-    run_id = board.running("t_730", claim_expires_in=-2067, owner=True,
-                           worker_lost="managed_worker_failed")
-    board.tick(failure_limit=2)
-    run = board.run(run_id)
     assert run["outcome"] == "reclaimed"
-    assert "managed worker lost: managed_worker_failed" in run["error"]
+    assert error in run["error"]
+    assert row["consecutive_failures"] == 1
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
     """The fence itself: a live owner PROCESS is not a live ATTEMPT."""
-    board.running("t_gateway", claim_expires_in=-2067, owner=True, admission=("terminal", "interrupted"))
+    import os
+    board.running("t_gateway", claim_expires_in=CLAIM_LAPSED, owner=True, owner_pid=os.getpid(),
+                  admission=("terminal", "interrupted"))
     assert kanban_owner_recovery.owner_reclaim_paused(board.conn, "t_gateway") is True
     assert kanban_owner_recovery.owner_attempt_provably_over(board.conn, "t_gateway") is True
     board.tick(failure_limit=2)
@@ -226,16 +224,20 @@ def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(b
 
 # --- the reclaim's kill step: an absent pid is gone, not "survived" -----------------------
 
-def test_a_signalled_absent_pid_is_terminated_not_unproven(board):
-    """The same reading through a signal seam: an OSError on a dead pid is a success."""
-    gone = _absent_pid(base=3_970_000)
+@pytest.mark.parametrize("live", [False, True], ids=["absent-pid", "live-pid"])
+def test_a_refused_signal_reads_the_pid_not_the_error(board, live):
+    """A bare OSError from the kill (Windows reports an absent pid as error 87) is a success only
+    when the pid is really gone; a live worker that refuses the signal is not terminated."""
+    import os
+    pid = os.getpid() if live else _absent_pid(base=3_970_000)
 
-    def windows_kill(pid, sig):
+    def refusing_kill(pid, sig):
         raise OSError(87, "The parameter is incorrect")
 
-    info = kbd._terminate_reclaimed_worker(gone, f"{HOST}:{_absent_pid(base=3_980_000)}",
-                                           signal_fn=windows_kill)
-    assert info["terminated"] is True
+    info = kbd._terminate_reclaimed_worker(pid, f"{HOST}:{_absent_pid(base=3_980_000)}",
+                                           started_at=kbd._process_fingerprint(pid) if live else None,
+                                           signal_fn=refusing_kill)
+    assert info["terminated"] is (not live)
 
 
 # --- D1: the OWNER writes the loss where the dispatcher can read it -----------------------

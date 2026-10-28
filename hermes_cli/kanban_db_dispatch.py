@@ -482,7 +482,7 @@ def _terminate_reclaimed_worker(
     except OSError:
         # Already gone = successful termination (Windows reports an absent pid as a bare OSError, not
         # ProcessLookupError). Leaving terminated=False would make the reclaim defer forever.
-        info["terminated"] = not _kb._pid_alive(pid)
+        info["terminated"] = not _worker_alive(pid, started_at)
         return info
 
     if _poll_worker_exit(pid, started_at):
@@ -960,10 +960,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
-        ):
+        metadata = _kb._json_dict(row["metadata"])  # a lost worker's run quotes its output: no text match
+        if outcome == "crashed" and not metadata.get("worker_lost") and (
+                metadata.get("protocol_violation") or "protocol violation" in (row["error"] or "")):
             streak += 1
             continue
         break

@@ -56,9 +56,7 @@ def owner_reclaim_paused(conn, task_id):
             return True
         from hermes_cli.process_identity import worker_birth
         return worker_birth(psutil.Process(receipt['pid'])) != receipt['birth']
-    except (OSError, ValueError, KeyError, sqlite3.Error):
-        return True
-    except psutil.Error:
+    except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return True
 
 
@@ -186,16 +184,19 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
-def owner_attempt_note(conn, task_id) -> str:
-    """One clause naming WHY a provably-over attempt ended, or ``""``.
+def owner_attempt_note(conn, task_id, lost=None) -> str:
+    """One clause naming why the owner says the attempt ended, or ``""``.
 
-    The reclaim paths record this beside the pid/claim evidence so the board says what
-    happened instead of a bare ``stale_lock=``: a managed worker that died (its owner
-    recorded ``worker_lost``) is a different fault from a worker that never started.
+    The reclaim paths put this in the run error so the board says what happened instead of
+    a bare ``stale_lock=``: a managed worker that died (its owner recorded ``worker_lost``,
+    passed as ``lost`` when the caller already read it) is a different fault from a worker
+    that never started.
     """
-    lost = str(_latest_run_event(conn, task_id, 'worker_lost').get('reason') or '')
-    if lost:
-        return f"managed worker lost: {lost[:80]}"
+    if lost is None:
+        lost = _latest_run_event(conn, task_id, 'worker_lost')
+    reason = str(lost.get('reason') or '')
+    if reason:
+        return f"managed worker lost: {reason[:80]}"
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return ""
@@ -214,25 +215,30 @@ def reclaim_error(conn, task_id, claim_lock) -> str:
 def apply_attempt_note(conn, task_id, pid, dead) -> None:
     """Fold the owner's own record of how the attempt ended into ONE dead worker's booking.
 
-    A managed worker that dies in ``worker.adopt`` writes no ``worker_result``, so its rc=0
-    exit trailer reads as a protocol violation. The owner's ``worker_lost`` evidence outranks
-    it: the turn never finished, so it books as a crash and charges the breaker, and the
+    A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
+    lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
+    turn never finished, so it books as a crash and charges the breaker, and the
     protocol-violation streak (which reads the persisted payload) does not count it.
     """
-    note = owner_attempt_note(conn, task_id)
+    lost = _latest_run_event(conn, task_id, "worker_lost")
+    note = owner_attempt_note(conn, task_id, lost)
     if not note:
         return
-    dead.error_text = f"{dead.error_text} [{note}]"
     dead.event_payload["attempt_note"] = note
-    lost = _latest_run_event(conn, task_id, "worker_lost")
     if lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
+            from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR
             dead.protocol_violation = False
             dead.event_payload.pop("protocol_violation", None)
             dead.event_payload["exit_kind"] = dead.kind
             dead.event_kind = "crashed"
-            dead.error_text = f"pid {pid} exited cleanly after its managed worker was lost [{note}]"
+            # Keep the worker's last output that _classify_dead_worker appended.
+            dead.error_text = (f"pid {pid} exited cleanly after its managed worker was lost."
+                               + dead.error_text.removeprefix(_PROTOCOL_VIOLATION_ERROR))
+    # Before the worker's own output: the stored error is capped, and the output may be long.
+    head, sep, output = dead.error_text.partition(" Worker's last output: ")
+    dead.error_text = f"{head} [{note}]{sep}{output}"
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
