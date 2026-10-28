@@ -555,7 +555,7 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
     without it the card's run learns nothing from its own loss. A deliberate Stop or a
     superseded generation is not a loss. Tracked, so retirement joins the write.
     """
-    if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
+    if (not policy.kanban_json or isinstance(exc, asyncio.CancelledError)
             or reason in ('managed_worker_stopped', 'stale_generation')):
         return None
     from gateway.session_kanban import record_worker_loss
