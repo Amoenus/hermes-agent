@@ -37,7 +37,7 @@ def _admission_row(receipt):
         with closing(sqlite3.connect(Path(receipt['db']).as_uri() + '?mode=ro', uri=True)) as owner:
             row = owner.execute('SELECT status,outcome FROM session_admissions WHERE target_session_id=? AND request_id=?',
                                 (receipt['session_id'], receipt['request_id'])).fetchone()
-    except (OSError, KeyError, sqlite3.Error):
+    except (OSError, KeyError, TypeError, ValueError, sqlite3.Error):
         return None
     return (row[0], row[1]) if row is not None else None
 
@@ -60,7 +60,6 @@ def owner_reclaim_paused(conn, task_id):
         return True
     except psutil.Error:
         return True
-
 
 
 def _latest_run_event(conn, task_id, kind):
@@ -141,27 +140,26 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     runs in exactly that shape. This asks the question that matters — can anything still be
     executing this attempt? — from evidence the board already keeps:
 
-      * no worker pid recorded for the run is alive (``tasks.worker_pid``, its ``spawned``
-        and ``worker_bound`` events);
-      * and the attempt is over by the owner's own verdict — the admission it recorded is
-        SETTLED (``status='terminal'``) — or, when the owner left no readable verdict, the
-        host-local claim has EXPIRED with no heartbeat inside
-        ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` and the owner's own process is gone.
+      * the run never bound an interpreter (a bound run is the crash sweep's to book);
+      * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned`` and
+        ``worker_bound`` events) is dead or recycled;
+      * and the owner's own admission is SETTLED (``status='terminal'``) with at least one
+        recorded pid, or the host-local claim has EXPIRED with no heartbeat inside
+        ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` and the admission is settled or (pids
+        recorded) the owner's process is gone.
 
-    The last clause used to demand the owner process be gone even when the owner had
-    already settled the admission. On a live install the owner is the long-lived gateway,
-    which is alive by design, so a manager-worker loss that settled the admission
-    ``terminal/interrupted`` could never be reclaimed: 2026-10-22, card t_f5fad63f held
-    ``running`` for 49 minutes after its managed worker died at ``worker.adopt`` 24 s in
-    (claim expired 34 minutes earlier, ``last_heartbeat_at`` NULL, every recorded pid dead).
-    A settled admission is the owner stating the attempt ended; it outranks the liveness of
-    the process that recorded it.
+    A settled admission outranks the owner's liveness: the owner is usually the long-lived
+    gateway, alive by design, and it settles a lost managed worker's admission without
+    extending the claim.
 
-    Missing evidence is never proof: no receipt, no live-or-dead pid evidence, a live pid whose
-    identity cannot be compared, or an unreadable clock all return False and the pause holds.
+    Missing evidence is never proof: no receipt, a live pid whose identity cannot be
+    compared, no recorded pid inside the claim's TTL, or an unreadable clock all return False
+    and the pause holds.
     """
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import _worker_alive
+    if _latest_run_event(conn, task_id, 'worker_bound'):
+        return False  # a bound run is the crash sweep's to book (bound_interpreter_gone)
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return False  # no receipt: this pause did not come from an owner attempt
@@ -172,19 +170,11 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
         return False
     pids = _run_worker_pids(conn, row, task_id)
     if any(_worker_alive(pid, fingerprint) for pid, fingerprint in pids):
-        return False  # a recorded interpreter is still live: it may still be executing
-    # Nothing recorded can still be executing. A SETTLED admission (the owner's own verdict that
-    # the attempt ended) is proof on its own — the owner process is a gateway, alive by design,
-    # and the claim may still be inside its TTL simply because nothing extended it.
-    try:
-        admission = _admission_row(receipt)
-    except (OSError, ValueError, KeyError, sqlite3.Error):
-        admission = None
-    if admission is not None and admission[0] == 'terminal':
-        return True
-    # Without an owner verdict, only an expired, unprogressing claim plus a gone owner proves it.
-    if not pids:
         return False
+    admission = _admission_row(receipt)
+    settled = admission is not None and admission[0] == 'terminal'
+    if settled and pids:
+        return True
     now = int(time.time())
     expires = kb._to_epoch(row['claim_expires'])
     if expires is None or expires >= now:
@@ -192,7 +182,8 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     heartbeat = kb._to_epoch(row['last_heartbeat_at'])
     if heartbeat is not None and now - heartbeat <= kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS:
         return False
-    return _owner_process_gone(receipt)
+    # No pid was ever recorded: only a lapsed claim lets the owner's verdict (or its death) speak.
+    return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
 def owner_attempt_note(conn, task_id) -> str:
@@ -208,14 +199,10 @@ def owner_attempt_note(conn, task_id) -> str:
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return ""
-    try:
-        admission = _admission_row(receipt)
-    except (OSError, ValueError, KeyError, sqlite3.Error):
-        return ""
+    admission = _admission_row(receipt)
     if admission is not None and admission[0] == 'terminal':
         return f"owner admission settled {admission[1] or 'terminal'}"
     return ""
-
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
