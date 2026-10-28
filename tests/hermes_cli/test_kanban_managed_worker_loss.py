@@ -25,7 +25,6 @@ These tests pin the disposition the dispatcher owes every lost attempt:
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
@@ -189,6 +188,12 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     assert run["outcome"] == "crashed"
     assert "managed worker lost" in run["error"]
     assert board.state("t_clean")["consecutive_failures"] == 1
+    # Not a protocol violation as well: one loss is charged to one budget.
+    assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
+    kinds = [r[0] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id='t_clean' AND run_id=?", (run_id,))]
+    assert "protocol_violation" not in kinds and "crashed" in kinds
+    assert kbd._protocol_violation_streak(board.conn, "t_clean") == 0
 
 
 # --- A2: an elapsed claim lock is never "still running" after one tick ---------------------
@@ -235,25 +240,6 @@ def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(b
 
 # --- the reclaim's kill step: an absent pid is gone, not "survived" -----------------------
 
-def test_terminating_an_absent_pid_reports_terminated(board):
-    """A pid that is already gone must not be reported as unproven termination.
-
-    Windows raises a bare ``OSError`` (WinError 87) for an absent PID instead of
-    ``ProcessLookupError``; reading that as "termination not proven" made the reclaim hold
-    the claim and defer every tick — the elapsed lock stayed ``running`` forever.
-    """
-    info = kbd._terminate_reclaimed_worker(_absent_pid(), f"{HOST}:{_absent_pid(base=3_960_000)}")
-    assert info["host_local"] is True
-    assert info["termination_attempted"] is True
-    assert info["terminated"] is True
-    if os.name == "nt":
-        # Only Windows reports an absent pid as a bare OSError, so only there does the kill
-        # step take the re-ask branch that marks this verdict; POSIX reaches the same
-        # ``terminated`` through ProcessLookupError (pinned on every platform by
-        # test_a_signalled_absent_pid_is_terminated_not_unproven).
-        assert info["already_gone"] is True
-
-
 def test_a_signalled_absent_pid_is_terminated_not_unproven(board):
     """The same reading through a signal seam: an OSError on a dead pid is a success."""
     gone = _absent_pid(base=3_970_000)
@@ -264,7 +250,6 @@ def test_a_signalled_absent_pid_is_terminated_not_unproven(board):
     info = kbd._terminate_reclaimed_worker(gone, f"{HOST}:{_absent_pid(base=3_980_000)}",
                                            signal_fn=windows_kill)
     assert info["terminated"] is True
-    assert info["already_gone"] is True
 
 
 # --- D1: the OWNER writes the loss where the dispatcher can read it -----------------------

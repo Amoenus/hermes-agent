@@ -486,14 +486,10 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     except OSError:
-        # Windows reports an ABSENT pid as a bare OSError (WinError 87 from OpenProcess),
-        # not ProcessLookupError, so reading every OSError as "termination not proven" made
-        # the reclaim hold the claim and defer every tick for a worker that was already gone:
-        # 2026-10-22 t_f5fad63f kept its card ``running`` with ``claim_expires`` 2067 s past.
-        # Ask liveness again: gone is the outcome the reclaim wanted, alive stays unproven.
+        # Windows reports an ABSENT pid as a bare OSError (WinError 87), not ProcessLookupError:
+        # ask liveness again, so a gone pid is terminated and only a live one stays unproven.
         if not _kb._pid_alive(pid):
             info["terminated"] = True
-            info["already_gone"] = True
         return info
 
     if _poll_worker_exit(pid, started_at):
@@ -1175,11 +1171,10 @@ class _CrashSweep:
 def _apply_attempt_note(conn, task_id, pid, dead: _DeadWorker) -> None:
     """Fold the owner's own record of how the attempt ended into ONE dead worker's booking.
 
-    A managed worker that dies during ``worker.adopt`` writes no ``worker_result``, so the
-    exit trailer alone can read as a clean protocol violation. The owner's ``worker_lost``
-    evidence outranks it: the attempt was lost, and it must charge the breaker like any other
-    crash instead of riding the protocol-violation budget (run 730 showed
-    ``consecutive_failures = 0`` after exactly this loss).
+    A managed worker that dies in ``worker.adopt`` writes no ``worker_result``, so its rc=0
+    exit trailer reads as a protocol violation. The owner's ``worker_lost`` evidence outranks
+    it: the turn never finished, so it books as a crash and charges the breaker, and the
+    protocol-violation streak (which reads the persisted payload) does not count it.
     """
     from hermes_cli.kanban_owner_recovery import _latest_run_event, owner_attempt_note
     note = owner_attempt_note(conn, task_id)
@@ -1190,11 +1185,11 @@ def _apply_attempt_note(conn, task_id, pid, dead: _DeadWorker) -> None:
     lost = _latest_run_event(conn, task_id, "worker_lost")
     if lost:
         dead.event_payload["worker_lost"] = lost
-        dead.protocol_violation = False
-        dead.rate_limited = False
-        if dead.kind == "clean_exit":
-            # A worker whose managed execution was lost never proved the turn finished.
-            dead.kind = "worker_lost"
+        if dead.protocol_violation:
+            dead.protocol_violation = False
+            dead.event_payload.pop("protocol_violation", None)
+            dead.event_payload["exit_kind"] = dead.kind
+            dead.event_kind = "crashed"
             dead.error_text = f"pid {pid} exited cleanly after its managed worker was lost [{note}]"
 
 
