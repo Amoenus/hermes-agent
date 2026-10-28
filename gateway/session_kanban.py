@@ -313,23 +313,15 @@ def _record_worker_result(context, code, last_output):
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
-    """Durably record that this attempt's managed execution was LOST — on the card's board.
+    """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
-    ``worker.adopt`` runs before ``bind_worker_context``, so a worker that dies in the adopt
-    handshake writes neither ``worker_bound`` nor ``worker_result``: the run learns nothing
-    from its own loss, and the dispatcher can only guess from a dead pid. 2026-10-22
-    (t_f5fad63f) the gateway logged ``Managed worker lost: managed_worker_failed`` 24 s in
-    and the card still said ``running`` 49 minutes later. A warning in a log file is not a
-    disposition, so the owner writes the disposition where the board can read it.
-
-    Best-effort and run-scoped: a loss recorded against a run the card has already moved
-    past is not evidence about the current attempt, so it is dropped. Never raises — the
-    loss itself must reach the caller.
+    Dropped when the card has moved past the run (it says nothing about the current attempt).
+    Never raises: the caller's own loss handling must not depend on the board write.
     """
-    context = json.loads(getattr(policy, 'kanban_json', None) or 'null')
-    if not context:
-        return
     try:
+        context = json.loads(getattr(policy, 'kanban_json', None) or 'null')
+        if not context:
+            return
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli import kanban_db as kb
         run_id = int(context['run_id'])
@@ -342,12 +334,9 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
                              {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
                               'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
                              run_id=run_id)
-    except Exception as exc:
-        # The loss must reach its caller, never be masked; the traceback is the only place a
-        # failing board write is diagnosable (the caller keeps the original loss either way).
+    except Exception:
         import logging
-        logging.getLogger(__name__).exception('kanban worker_lost record failed: %s',
-                                              type(exc).__name__)
+        logging.getLogger(__name__).exception('kanban worker_lost record failed')
 
 
 def _bound_worker_matches(conn, context):

@@ -24,6 +24,9 @@ HELLO_SECONDS = 60
 # After Stop the child interrupts its agent and emits its result; the owner terminates a
 # child that has not acknowledged within this window instead of waiting on the pipe forever.
 STOP_ACK_SECONDS = 30
+# How long a lost attempt's board note may hold up settling its admission (the note is
+# advisory; a busy board's write finishes in the background).
+LOSS_RECORD_WAIT_S = 10
 # Own session (POSIX): a worker whose owner died kills its whole group (managed_worker
 # _die_with_owner); on Windows it exits itself.
 WORKER_POPEN = {'start_new_session': True, 'close_fds': True}
@@ -545,21 +548,37 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
-async def _record_lost_attempt(policy, reason, scope):
-    """Leave a BOARD disposition for a lost attempt, not only the log line above.
+def _record_lost_attempt(authority, policy, exc, reason, scope):
+    """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
-    ``worker.adopt`` precedes ``bind_worker_context``, so a worker that dies in the handshake
-    never writes ``worker_bound``/``worker_result`` and the card's run learns nothing
-    (2026-10-22: 49 minutes of "in progress" on a corpse). A deliberate Stop or a superseded
-    generation is not a loss, and a turn with no board has nowhere to write.
+    A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
+    without it the card's run learns nothing from its own loss. A deliberate Stop or a
+    superseded generation is not a loss. Tracked, so retirement joins the write.
     """
-    if not getattr(policy, 'kanban_json', None):
-        return
-    if reason in ('managed_worker_stopped', 'stale_generation', 'CancelledError'):
-        return
+    if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
+            or reason in ('managed_worker_stopped', 'stale_generation')):
+        return None
     from gateway.session_kanban import record_worker_loss
-    await asyncio.to_thread(record_worker_loss, policy, reason,
-                            pid=(scope or {}).get('pid'), bound=scope is not None)
+    from gateway.session_runtime_workers import track_mutation
+    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
+                                                               pid=(scope or {}).get('pid'), bound=scope is not None)))
+
+
+async def _settle_lost(authority, row, scope, recording):
+    """Settle a lost worker's admission ``unknown`` once its board note (``recording``) landed.
+
+    The note comes first: the submitter exits on the settled 'unknown' and the crash sweep then
+    books the bound interpreter, so a later write is dropped and an exit-0 worker_result reads
+    as a protocol violation. A busy board holds this up ``LOSS_RECORD_WAIT_S`` at most (the
+    write carries on, tracked), and a cancellation during the wait still settles.
+    """
+    from gateway.session_worker_reservation import lose_admission_worker
+    from gateway.session_runtime_workers import tracked_write
+    try:
+        if recording is not None:
+            await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
+    finally:
+        await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
 
 
 async def _spawn_registered_worker(authority, ref, row):
@@ -694,17 +713,15 @@ async def execute_managed(authority, ref, row, policy):
         import logging
         reason = exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__
         logging.getLogger(__name__).warning('Managed worker lost: %s', reason)
-        await _record_lost_attempt(policy, reason, scope)
         if scope is None:
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
+            _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
-        from gateway.session_worker_reservation import lose_admission_worker
-        from gateway.session_runtime_workers import tracked_write
-        await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
             live.controls.snapshot(ref.session_id, None)

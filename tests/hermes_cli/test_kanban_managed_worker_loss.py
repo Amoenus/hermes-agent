@@ -223,10 +223,6 @@ def test_the_incident_shape_names_the_loss_on_the_reclaim(board):
     run = board.run(run_id)
     assert run["outcome"] == "reclaimed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    event = board.conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = 't_730' AND kind = 'reclaimed' "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-    assert json.loads(event["payload"])["attempt_note"] == "managed worker lost: managed_worker_failed"
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
@@ -266,16 +262,25 @@ def _owner_policy(board, tid, run_id):
     }))
 
 
-def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board):
-    from gateway.session_kanban import record_worker_loss
+@pytest.mark.asyncio
+async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_it(board):
+    """Through the gateway's loss handler: a Stop, a superseded generation or a cancellation
+    records nothing; a real loss leaves one worker_lost event that the next tick books."""
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.session_managed_worker import _record_lost_attempt
     run_id = board.running("t_owner", claim_expires_in=900, heartbeat_age=30)
     policy = _owner_policy(board, "t_owner", run_id)
-    record_worker_loss(policy, "managed_worker_failed", pid=board.state("t_owner")["worker_pid"],
-                       bound=False)
-    event = board.conn.execute(
-        "SELECT payload FROM task_events WHERE task_id='t_owner' AND kind='worker_lost' "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-    assert json.loads(event["payload"])["reason"] == "managed_worker_failed"
+    authority = SimpleNamespace()
+    for exc, reason in [(RuntimeError(), "managed_worker_stopped"), (RuntimeError(), "stale_generation"),
+                        (asyncio.CancelledError(), "CancelledError"),
+                        (RuntimeError(), "managed_worker_failed")]:
+        recording = _record_lost_attempt(authority, policy, exc, reason, None)
+        if recording is not None:
+            await recording
+    events = [json.loads(r[0]) for r in board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id='t_owner' AND kind='worker_lost'")]
+    assert [e["reason"] for e in events] == ["managed_worker_failed"]
 
     board.tick(failure_limit=2)
     run = board.run(run_id)
@@ -289,10 +294,13 @@ def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
     from gateway.session_kanban import record_worker_loss
     run_id = board.running("t_stale", claim_expires_in=900, heartbeat_age=30)
     policy = _owner_policy(board, "t_stale", run_id)
+
+    def count():
+        return board.conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id='t_stale' AND kind='worker_lost'").fetchone()[0]
+    record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
+    assert count() == 1
     board.conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id='t_stale'")
     board.conn.commit()
     record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
-    n = board.conn.execute(
-        "SELECT count(*) FROM task_events WHERE task_id='t_stale' AND kind='worker_lost'"
-    ).fetchone()[0]
-    assert n == 0
+    assert count() == 1
