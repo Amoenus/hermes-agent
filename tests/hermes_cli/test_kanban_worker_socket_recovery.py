@@ -11,8 +11,10 @@ import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
+from websockets.exceptions import InvalidMessage
 
 from hermes_cli import gateway_client, kanban_worker_client
+from hermes_cli.gateway_runtime_discovery import DiscoveryError
 
 
 class _Clock:
@@ -40,7 +42,7 @@ class _Owner:
     @staticmethod
     def _step(steps, default=None):
         step = steps.pop(0) if steps else default
-        if callable(step) and not isinstance(step, Exception):
+        if callable(step):
             step = step()
         if isinstance(step, Exception):
             raise step
@@ -108,7 +110,14 @@ async def _run(owner, monkeypatch, tmp_path):
     gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
     ConnectionRefusedError(61, "refused"),
     gateway_client.GatewayUnavailableError("Gateway starting: not_ready", "starting"),
-], ids=["reconnects", "dial-refused", "ticket-oserror", "owner-starting"])
+    gateway_client.GatewayUnavailableError("Gateway inaccessible: invalid_control_peer",
+                                           "inaccessible", "invalid_control_peer"),
+    gateway_client.GatewayUnavailableError("Gateway inaccessible: incomplete_control_response",
+                                           "inaccessible", "incomplete_control_response"),
+    DiscoveryError("invalid_control_response"),
+    InvalidMessage("did not receive a valid HTTP response"),
+], ids=["reconnects", "dial-refused", "ticket-oserror", "owner-starting", "control-reset", "control-eof",
+        "owner-replaced", "handshake"])
 async def test_a_socket_lost_mid_turn_resumes_the_same_attempt(monkeypatch, _worker_env, clock, redial):
     owner = _Owner(connects=[None, redial, None], receipts=["pending", _disconnect(), "terminal"])
 
@@ -116,6 +125,15 @@ async def test_a_socket_lost_mid_turn_resumes_the_same_attempt(monkeypatch, _wor
     # The claim is submitted once: every later connection re-reads the receipt.
     assert owner.calls.count("kanban.run") == 1
     assert owner.dials == (2 if redial is None else 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["runtime_draining", "runtime_retired"])
+async def test_a_draining_or_retired_authority_mid_turn_is_asked_again(monkeypatch, _worker_env, clock, reason):
+    owner = _Owner(connects=[None, None], receipts=["pending", gateway_client.GatewayRPCError(reason), "terminal"])
+
+    assert await _run(owner, monkeypatch, _worker_env) == 0
+    assert owner.dials == 2 and owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio
@@ -143,6 +161,19 @@ async def test_an_owner_refusal_is_not_retried(monkeypatch, _worker_env, clock, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("final", [
+    gateway_client.GatewayUnavailableError("Gateway inaccessible: authorization", "inaccessible", "authorization"),
+    DiscoveryError("unsafe_control_permissions"),
+], ids=["refused-control", "unsafe-control"])
+async def test_an_owner_that_cannot_be_trusted_fails_at_once(monkeypatch, _worker_env, clock, final):
+    owner = _Owner(connects=[None, final], receipts=["pending", _disconnect()])
+
+    with pytest.raises(type(final)):
+        await _run(owner, monkeypatch, _worker_env)
+    assert owner.dials == 2
+
+
+@pytest.mark.asyncio
 async def test_a_later_loss_gets_a_fresh_budget_from_the_owners_last_answer(monkeypatch, _worker_env, clock):
     def silent_then_lost():
         clock.now += kanban_worker_client.OWNER_WAIT_S - 10
@@ -157,11 +188,46 @@ async def test_a_later_loss_gets_a_fresh_budget_from_the_owners_last_answer(monk
 
 
 @pytest.mark.asyncio
+async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
+    # Every redial connects, but every receipt read drops: only the owner's answers refresh the
+    # budget, so this still ends at OWNER_WAIT_S instead of redialling forever.
+    owner = _Owner(receipts=["pending"] + [_disconnect()] * 200)
+
+    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds"):
+        await _run(owner, monkeypatch, _worker_env)
+    assert owner.calls.count("kanban.run") == 1
+
+
+@pytest.mark.asyncio
 async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock):
     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], refuse_dials_after=True)
 
-    with pytest.raises(gateway_client.GatewayClientError, match="unreachable for 180s"):
+    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds: Gateway connection failed"):
         await _run(owner, monkeypatch, _worker_env)
     assert clock.now >= kanban_worker_client.OWNER_WAIT_S
-    # Jittered exponential backoff (capped at 8-12 s) between dials, not one dial a second.
+    # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
     assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
+
+
+@pytest.mark.asyncio
+async def test_giving_up_on_a_refused_handshake_names_the_status(monkeypatch, _worker_env, clock):
+    from types import SimpleNamespace
+    from websockets.exceptions import InvalidStatus
+    refused = InvalidStatus(SimpleNamespace(status_code=403, headers={}, body=b"remote body"))
+    owner = _Owner(connects=[None] + [refused] * 60, receipts=["pending", _disconnect()])
+
+    with pytest.raises(gateway_client.GatewayClientError, match=r"InvalidStatus \(HTTP 403\)$"):
+        await _run(owner, monkeypatch, _worker_env)
+
+
+@pytest.mark.asyncio
+async def test_discovery_hands_the_worker_its_reason(monkeypatch, _worker_env):
+    """The real connect_gateway carries discovery's reason, which is what tells a restarting
+    owner's reset control socket apart from a foreign one."""
+    from hermes_cli import gateway_runtime
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", lambda *_, **__: gateway_runtime.GatewayDiscovery(
+        "inaccessible", reason_code="incomplete_control_response"))
+    with pytest.raises(gateway_client.GatewayUnavailableError) as raised:
+        async with gateway_client.connect_gateway():
+            pass
+    assert (raised.value.state, raised.value.reason_code) == ("inaccessible", "incomplete_control_response")
