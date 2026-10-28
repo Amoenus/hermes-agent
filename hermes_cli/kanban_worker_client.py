@@ -26,8 +26,8 @@ _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
 # retired authority's successor holds the admission the next connection reads.
 _TRANSIENT_RPC_REASONS = frozenset({'runtime_draining', 'runtime_retired'})
-# Control-socket answers a restarting owner gives (discovery's ``inaccessible`` reason, or the
-# ticket fetch's DiscoveryError): a reset or half-written answer, or a replaced owner refusing a
+# Control-socket answers a restarting owner gives (an ``inaccessible`` owner's reason, from
+# discovery or the ticket fetch): a reset or half-written answer, or a replaced owner refusing a
 # stale instance. Unsafe nodes or peers, a refused authorization, a bad pointer or a failed start
 # stay final.
 _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_control_response',
@@ -58,9 +58,7 @@ class _Claim:
 
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
-    from hermes_cli.gateway_client import (connect_gateway, GatewayClientError, GatewayRPCError,
-                                           GatewayUnavailableError)
-    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+    from hermes_cli.gateway_client import connect_gateway, GatewayClientError
     from websockets.exceptions import WebSocketException
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
@@ -82,19 +80,11 @@ async def run(params, board_db):
                     receipt = await _await_receipt(client, params, board_db, claim)
                 finally:
                     drain.cancel()
-        except GatewayRPCError as exc:
-            if str(exc) not in _TRANSIENT_RPC_REASONS or claim.silent_for() >= OWNER_WAIT_S:
-                raise
-        except GatewayUnavailableError as exc:
-            restarting = exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
-            if not restarting or claim.silent_for() >= OWNER_WAIT_S:
-                raise
-        except DiscoveryError as exc:
-            if exc.reason not in _RESTART_CONTROL_REASONS or claim.silent_for() >= OWNER_WAIT_S:
-                raise
         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
         # that never came.
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
+            if not _restartable(exc):
+                raise
             if claim.silent_for() >= OWNER_WAIT_S:
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
@@ -104,9 +94,19 @@ async def run(params, board_db):
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
-        # Full-width jitter: after an owner dies, every worker redials at once, and each that finds
-        # it absent starts a replacement.
+        # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
+        # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
+
+
+def _restartable(exc):
+    """False when *exc* is the owner's own final answer; True for a restarting owner or a lost transport."""
+    from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
+    if isinstance(exc, GatewayRPCError):
+        return str(exc) in _TRANSIENT_RPC_REASONS
+    if isinstance(exc, GatewayUnavailableError):
+        return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
+    return True
 
 
 async def _discard(events):

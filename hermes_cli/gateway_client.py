@@ -276,6 +276,7 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
     from urllib.parse import urlsplit
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
@@ -304,7 +305,13 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
             raise GatewayUnavailableError(f"Gateway {result.state}: {result.reason_code or 'not_ready'}{detail}",
                                           result.state, result.reason_code)
         endpoint = result.endpoint
-        ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
+        try:
+            ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
+        except DiscoveryError as exc:
+            # The control socket refused the ticket: the verdict discovery gives the same refusal.
+            detail = exc.bounded_detail(500)
+            raise GatewayUnavailableError(f"Gateway inaccessible: {exc.reason}" + (f" ({detail})" if detail else ""),
+                                          "inaccessible", exc.reason) from exc
         url, protocols = gateway_ws_target(endpoint, ticket)
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the

@@ -16,6 +16,8 @@ from websockets.exceptions import InvalidMessage
 from hermes_cli import gateway_client, kanban_worker_client
 from hermes_cli.gateway_runtime_discovery import DiscoveryError
 
+GUE = gateway_client.GatewayUnavailableError
+
 
 class _Clock:
     """Monotonic time that moves only when the client sleeps or a scripted step advances it."""
@@ -30,12 +32,12 @@ class _Clock:
 class _Owner:
     """Scripted owner. ``connects`` holds one step per dial, ``receipts`` one per ``prompt.receipt``
     and ``submits`` one per ``kanban.run``; a step is None (succeed), an exception (raised) or a
-    callable (run first, so it can advance the clock or raise). ``refuse_dials_after`` fails every
-    dial past the scripted ones with a refused connection."""
+    callable (run first, so it can advance the clock or raise). ``after`` is the step for every
+    dial past the scripted ones (None: the dial succeeds)."""
 
-    def __init__(self, connects=(), receipts=(), submits=(), refuse_dials_after=False):
+    def __init__(self, connects=(), receipts=(), submits=(), after=None):
         self.connects, self.receipts, self.submits = list(connects), list(receipts), list(submits)
-        self.refuse_dials_after = refuse_dials_after
+        self.after = after
         self.calls = []
         self.dials = 0
 
@@ -54,8 +56,7 @@ class _Owner:
         @asynccontextmanager
         async def _connect():
             owner.dials += 1
-            refused = gateway_client.GatewayClientError("Gateway connection failed; no local fallback")
-            owner._step(owner.connects, refused if owner.refuse_dials_after else None)
+            owner._step(owner.connects, owner.after)
 
             class _Client:
                 def __init__(self):
@@ -114,7 +115,7 @@ async def _run(owner, monkeypatch, tmp_path):
                                            "inaccessible", "invalid_control_peer"),
     gateway_client.GatewayUnavailableError("Gateway inaccessible: incomplete_control_response",
                                            "inaccessible", "incomplete_control_response"),
-    DiscoveryError("invalid_control_response"),
+    GUE("Gateway inaccessible: invalid_control_response", "inaccessible", "invalid_control_response"),
     InvalidMessage("did not receive a valid HTTP response"),
 ], ids=["reconnects", "dial-refused", "ticket-oserror", "owner-starting", "control-reset", "control-eof",
         "owner-replaced", "handshake"])
@@ -163,7 +164,7 @@ async def test_an_owner_refusal_is_not_retried(monkeypatch, _worker_env, clock, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final", [
     gateway_client.GatewayUnavailableError("Gateway inaccessible: authorization", "inaccessible", "authorization"),
-    DiscoveryError("unsafe_control_permissions"),
+    GUE("Gateway inaccessible: unsafe_control_permissions", "inaccessible", "unsafe_control_permissions"),
 ], ids=["refused-control", "unsafe-control"])
 async def test_an_owner_that_cannot_be_trusted_fails_at_once(monkeypatch, _worker_env, clock, final):
     owner = _Owner(connects=[None, final], receipts=["pending", _disconnect()])
@@ -199,10 +200,17 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
 
 
 @pytest.mark.asyncio
-async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock):
-    owner = _Owner(connects=[None], receipts=["pending", _disconnect()], refuse_dials_after=True)
+@pytest.mark.parametrize("fault", [
+    gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
+    GUE("Gateway starting: deadline", "starting", "deadline"),
+    GUE("Gateway inaccessible: invalid_control_peer", "inaccessible", "invalid_control_peer"),
+    gateway_client.GatewayRPCError("runtime_draining"),
+], ids=["refused", "starting", "control-reset", "draining"])
+async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock, fault):
+    # Every restart shape still ends at OWNER_WAIT_S when it never clears.
+    owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds: Gateway connection failed"):
+    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
         await _run(owner, monkeypatch, _worker_env)
     assert clock.now >= kanban_worker_client.OWNER_WAIT_S
     # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
@@ -231,3 +239,20 @@ async def test_discovery_hands_the_worker_its_reason(monkeypatch, _worker_env):
         async with gateway_client.connect_gateway():
             pass
     assert (raised.value.state, raised.value.reason_code) == ("inaccessible", "incomplete_control_response")
+
+
+@pytest.mark.asyncio
+async def test_a_refused_ticket_reads_like_a_refusing_owner(monkeypatch, _worker_env):
+    """The ticket fetch's DiscoveryError reaches callers as the inaccessible verdict discovery gives."""
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", lambda *_, **__: SimpleNamespace(endpoint=None))
+    monkeypatch.setattr(gateway_runtime, "attachable", lambda result: True)
+
+    def refuse(*_):
+        raise DiscoveryError("invalid_control_response")
+    monkeypatch.setattr(gateway_client, "_session_ticket", refuse)
+    with pytest.raises(GUE) as raised:
+        async with gateway_client.connect_gateway():
+            pass
+    assert (raised.value.state, raised.value.reason_code) == ("inaccessible", "invalid_control_response")
