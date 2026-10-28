@@ -19,24 +19,11 @@ import time
 # until an owner is ready, so waiting can never run the claim twice.
 OWNER_WAIT_S = 180.0
 _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
-# An owner that is up but draining refuses in band (JSON-RPC error), before admitting anything.
-_TRANSIENT_RPC_REASONS = frozenset({'runtime_draining'})
+# In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
+# retired authority's successor holds the admission the next connection reads.
+_TRANSIENT_RPC_REASONS = frozenset({'runtime_draining', 'runtime_retired'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
-
-
-class _Redial(Exception):
-    """The socket died after the owner admitted the claim: reconnect and re-read the receipt.
-
-    The admission id and session id are the durable handle for the attempt (the owner keeps the
-    admission across client connections), so a dead socket is a transport event rather than a turn
-    outcome. Exiting instead would let ``_watch_submitter`` end the owner's in-flight turn.
-    """
-
-    def __init__(self, admission):
-        super().__init__('gateway connection lost after the owner admitted the claim')
-        self.admission = admission
-
 
 
 def admission_answer_budget():
@@ -49,56 +36,45 @@ def admission_answer_budget():
 
 
 async def run(params, board_db):
+    from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import (connect_gateway, GatewayClientError, GatewayRPCError,
                                            GatewayUnavailableError)
+    from websockets.exceptions import ConnectionClosed
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
-    deadline = time.monotonic() + OWNER_WAIT_S
-    # A lost socket is not a lost attempt: after the owner admits the claim, the admission id is
-    # what the next connection re-reads. Bounded once, so a flapping gateway cannot hold the worker
-    # for ever and a truly gone owner still fails honestly.
-    admission = None
-    redial_deadline = None
-    # A connection alone is not progress: receipt reads must succeed before a new
-    # recovery episode can receive a fresh bounded budget.
-    progress = [False]
+    # A lost socket is not a lost attempt, and exiting here would let ``_watch_submitter`` end the
+    # owner's in-flight turn. ``kanban.run`` is idempotent per attempt (one request id per card run)
+    # and ``prompt.receipt`` is a read, so the next connection resumes whatever the last one reached.
+    # The wait is bounded from the owner's last answer: an owner that keeps answering keeps the
+    # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
+    claim = {'answered': time.monotonic()}
+    failures, answered = 0, claim['answered']
     while True:
         try:
             async with connect_gateway() as client:
-                progress[0] = False
                 # kanban.run subscribes this socket to the card's session, but only receipts matter
                 # here: discard the turn's events, or they fill the client's bounded queue and its
                 # reader stops, with the next receipt behind it.
                 drain = asyncio.create_task(_discard(client.events))
                 try:
-                    return await _submit_claim(client, params, board_db, admission, progress)
+                    receipt = await _await_receipt(client, params, board_db, claim)
                 finally:
                     drain.cancel()
-        except _Redial as exc:
-            admission = exc.admission
-            if progress[0]:
-                # A successful receipt read proves the prior recovery episode made progress.
-                redial_deadline = None
-            if redial_deadline is None:
-                redial_deadline = time.monotonic() + OWNER_WAIT_S
-            if time.monotonic() >= redial_deadline:
-                # The attempt stays readable for its owner; failing honestly beats resubmitting it.
-                raise GatewayClientError('Kanban owner connection lost after admission: the attempt '
-                                         'is retained by the owner; do not resend the work') from None
-            await asyncio.sleep(1)
         except GatewayRPCError as exc:
-            # Nothing was submitted when the owner refused the claim, so this is the host's state.
-            if admission is not None or str(exc) not in _TRANSIENT_RPC_REASONS or time.monotonic() >= deadline:
+            if str(exc) not in _TRANSIENT_RPC_REASONS or time.monotonic() - claim['answered'] >= OWNER_WAIT_S:
                 raise
-            await asyncio.sleep(1)
         except GatewayUnavailableError as exc:
-            # Before admission, use the initial owner-startup deadline. While recovering an
-            # admitted attempt, use that recovery episode's deadline instead.
-            wait_deadline = (redial_deadline if admission is not None and redial_deadline is not None
-                             else deadline)
-            if exc.state not in _TRANSIENT_OWNER_STATES or time.monotonic() >= wait_deadline:
+            if exc.state not in _TRANSIENT_OWNER_STATES or time.monotonic() - claim['answered'] >= OWNER_WAIT_S:
                 raise
-            await asyncio.sleep(1)
+        except (GatewayClientError, ConnectionClosed, OSError, TimeoutError) as exc:
+            if time.monotonic() - claim['answered'] >= OWNER_WAIT_S:
+                raise GatewayClientError(f'Kanban owner unreachable for {OWNER_WAIT_S:.0f}s: {exc}') from exc
+        else:
+            return _exit_code(receipt, params, board_db)
+        if claim['answered'] != answered:
+            failures, answered = 0, claim['answered']
+        failures += 1
+        await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0))
 
 
 async def _discard(events):
@@ -106,43 +82,35 @@ async def _discard(events):
         await events.get()
 
 
-async def _receipt(client, session_id, admission_id):
-    """One ``prompt.receipt`` read. A transport loss becomes a redial; an owner's answer does not."""
-    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
-    from websockets.exceptions import ConnectionClosed
-    try:
-        return await client.rpc('prompt.receipt', session_id=session_id, admission_id=admission_id)
-    except GatewayRPCError:
-        raise
-    except (GatewayClientError, ConnectionClosed, OSError, TimeoutError):
-        raise _Redial((session_id, admission_id)) from None
-
-
-async def _submit_claim(client, params, board_db, admission=None, progress=None):
-    from hermes_cli.gateway_client import GatewayClientError
-    db = str(await asyncio.to_thread(Path(board_db).resolve))
-    # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
-    # in one board write transaction. The board (the cross-profile dispatch bus) can make that
-    # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
-    # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
-    # admission was left ``unknown``). The wait is still finite: once the marker commits,
-    # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
-    # that stalls after admitting is bounded only here. A hang-up fails the wait sooner.
-    if admission is None:
+async def _await_receipt(client, params, board_db, claim):
+    """Submit the claim (or, on a later connection, re-read the admission it got) and return its
+    settled receipt. *claim* carries the owner's ``session_id``/``admission_id`` and the monotonic
+    time of its last answer across connections."""
+    if 'admission_id' not in claim:
+        db = str(await asyncio.to_thread(Path(board_db).resolve))
+        # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
+        # in one board write transaction. The board (the cross-profile dispatch bus) can make that
+        # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
+        # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
+        # admission was left ``unknown``). The wait is still finite: once the marker commits,
+        # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
+        # that stalls after admitting is bounded only here. A hang-up fails the wait sooner.
         accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
-        sid, receipt = accepted['session_id'], accepted['receipt']
-        print(f'Session: {sid}', file=sys.stderr)
-        admission = (sid, receipt['admission_id'])
+        receipt = accepted['receipt']
+        claim.update(session_id=accepted['session_id'], admission_id=receipt['admission_id'])
+        print(f'Session: {claim["session_id"]}', file=sys.stderr)
     else:
-        # A redial re-reads the attempt the owner already holds; it never submits the claim again.
-        receipt = await _receipt(client, *admission)
-        if progress is not None:
-            progress[0] = True
+        receipt = await _receipt(client, claim)
+    claim['answered'] = time.monotonic()
     while receipt['status'] not in {'terminal', 'unknown'}:
         await asyncio.sleep(.2)
-        receipt = await _receipt(client, *admission)
-        if progress is not None:
-            progress[0] = True
+        receipt = await _receipt(client, claim)
+        claim['answered'] = time.monotonic()
+    return receipt
+
+
+def _exit_code(receipt, params, board_db):
+    from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
         raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
@@ -151,6 +119,10 @@ async def _submit_claim(client, params, board_db, admission=None, progress=None)
     if result.get('last_output'):
         print(result['last_output'])
     return result.get('exit_code', 1)
+
+
+async def _receipt(client, claim):
+    return await client.rpc('prompt.receipt', session_id=claim['session_id'], admission_id=claim['admission_id'])
 
 
 def main():

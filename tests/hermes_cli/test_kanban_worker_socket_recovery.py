@@ -1,10 +1,10 @@
-"""A Kanban worker whose gateway socket dies mid-turn redials and re-reads the same receipt.
+"""A Kanban worker whose gateway socket dies mid-turn resumes the same attempt on a new connection.
 
-A dead socket is a transport event, not a turn outcome: the owner keeps the admission and answers
-``prompt.receipt`` over the next connection, so exiting 1 there loses work that was already running
-(``_watch_submitter`` then ends the owner's in-flight turn). Measured before the fix: 93 runs booked
-``crashed`` on a gateway disconnect, 80 of them already admitted and bound, 0 with a
-``worker_result``. An owner's own refusal is still an answer, and a genuine refusal still fails.
+A dead socket is a transport event, not a turn outcome: the owner keeps the admission, answers
+``prompt.receipt`` over the next connection and returns the same admission for a repeated
+``kanban.run`` (one request id per attempt). Exiting 1 instead loses work that was already running,
+because ``_watch_submitter`` then ends the owner's in-flight turn (#145062). An owner's own refusal
+is still an answer, and an owner that stays silent still fails the worker.
 """
 
 import asyncio
@@ -15,17 +15,36 @@ import pytest
 from hermes_cli import gateway_client, kanban_worker_client
 
 
-class _Owner:
-    """Scripted owner: ``connects`` holds one entry per dial (an exception fails the dial), and
-    ``receipts`` holds one entry per ``prompt.receipt`` read (an exception is a transport loss).
-    ``submit_failures`` holds entries consumed by ``kanban.run``."""
+class _Clock:
+    """Monotonic time that moves only when the client sleeps or a scripted step advances it."""
 
-    def __init__(self, connects=None, receipts=None, submit_failures=None):
-        self.connects = list(connects or [])
-        self.receipts = list(receipts or [])
-        self.submit_failures = list(submit_failures or [])
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+class _Owner:
+    """Scripted owner. ``connects`` holds one step per dial, ``receipts`` one per ``prompt.receipt``
+    and ``submits`` one per ``kanban.run``; a step is None (succeed), an exception (raised) or a
+    callable (run first, so it can advance the clock or raise). ``refuse_dials_after`` fails every
+    dial past the scripted ones with a refused connection."""
+
+    def __init__(self, connects=(), receipts=(), submits=(), refuse_dials_after=False):
+        self.connects, self.receipts, self.submits = list(connects), list(receipts), list(submits)
+        self.refuse_dials_after = refuse_dials_after
         self.calls = []
         self.dials = 0
+
+    @staticmethod
+    def _step(steps, default=None):
+        step = steps.pop(0) if steps else default
+        if callable(step) and not isinstance(step, Exception):
+            step = step()
+        if isinstance(step, Exception):
+            raise step
+        return step
 
     def connect(self):
         owner = self
@@ -33,9 +52,8 @@ class _Owner:
         @asynccontextmanager
         async def _connect():
             owner.dials += 1
-            step = owner.connects.pop(0) if owner.connects else None
-            if isinstance(step, Exception):
-                raise step
+            refused = gateway_client.GatewayClientError("Gateway connection failed; no local fallback")
+            owner._step(owner.connects, refused if owner.refuse_dials_after else None)
 
             class _Client:
                 def __init__(self):
@@ -44,14 +62,10 @@ class _Owner:
                 async def rpc(self, method, **params):
                     owner.calls.append(method)
                     if method == "kanban.run":
-                        failure = owner.submit_failures.pop(0) if owner.submit_failures else None
-                        if failure is not None:
-                            raise failure
+                        owner._step(owner.submits)
                         return {"session_id": "s1", "receipt": {"status": "pending", "admission_id": "a1"}}
-                    status = owner.receipts.pop(0) if owner.receipts else "terminal"
-                    if isinstance(status, Exception):
-                        raise status
-                    return {"status": status}
+                    assert params == {"session_id": "s1", "admission_id": "a1"}
+                    return {"status": owner._step(owner.receipts, "terminal")}
 
             yield _Client()
 
@@ -63,128 +77,91 @@ def _disconnect():
         "Gateway disconnected; turn outcome is unknown. Resume the printed session ID")
 
 
+@pytest.fixture
+def clock(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(kanban_worker_client, "time", clock)
+
+    async def _sleep(seconds):
+        clock.now += seconds
+    monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _sleep)
+    return clock
+
+
 @pytest.fixture(autouse=True)
 def _worker_env(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
-    monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _no_sleep)
     from gateway import session_kanban
     monkeypatch.setattr(session_kanban, "worker_result",
                         lambda *_: {"exit_code": 0, "last_output": "card closed"})
     return tmp_path
 
 
-async def _no_sleep(_seconds):
-    return None
+async def _run(owner, monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+    return await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
 
 
 @pytest.mark.asyncio
-async def test_a_socket_lost_mid_turn_redials_and_settles_the_same_attempt(monkeypatch, _worker_env):
-    owner = _Owner(connects=[None, None],
-                   receipts=["pending", _disconnect(), "terminal"])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+@pytest.mark.parametrize("redial", [
+    None,
+    gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
+    ConnectionRefusedError(61, "refused"),
+    gateway_client.GatewayUnavailableError("Gateway starting: not_ready", "starting"),
+], ids=["reconnects", "dial-refused", "ticket-oserror", "owner-starting"])
+async def test_a_socket_lost_mid_turn_resumes_the_same_attempt(monkeypatch, _worker_env, clock, redial):
+    owner = _Owner(connects=[None, redial, None], receipts=["pending", _disconnect(), "terminal"])
 
-    assert await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db")) == 0
-    # The claim is submitted once: the redial re-reads the receipt, it does not resubmit.
+    assert await _run(owner, monkeypatch, _worker_env) == 0
+    # The claim is submitted once: every later connection re-reads the receipt.
     assert owner.calls.count("kanban.run") == 1
-    assert owner.dials == 2
+    assert owner.dials == (2 if redial is None else 3)
 
 
 @pytest.mark.asyncio
-async def test_a_draining_owner_is_retried_before_anything_is_admitted(monkeypatch, _worker_env):
-    owner = _Owner(connects=[None, None],
-                   submit_failures=[gateway_client.GatewayRPCError("runtime_draining")],
-                   receipts=["terminal"])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+@pytest.mark.parametrize("lost", [_disconnect(), gateway_client.GatewayRPCError("runtime_draining")],
+                         ids=["answer-lost", "draining"])
+async def test_a_claim_with_no_answer_is_resubmitted(monkeypatch, _worker_env, clock, lost):
+    # No admission id reached the worker, so it asks again; the owner answers a repeated
+    # kanban.run for the same attempt with the same admission.
+    owner = _Owner(connects=[None, None], submits=[lost], receipts=["terminal"])
 
-    assert await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db")) == 0
+    assert await _run(owner, monkeypatch, _worker_env) == 0
     assert owner.calls.count("kanban.run") == 2
 
 
 @pytest.mark.asyncio
-async def test_an_owner_refusal_is_not_a_redial(monkeypatch, _worker_env):
-    owner = _Owner(connects=[None, None],
-                   submit_failures=[gateway_client.GatewayRPCError("claim_mismatch")])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+@pytest.mark.parametrize("where", ["kanban.run", "prompt.receipt"])
+async def test_an_owner_refusal_is_not_retried(monkeypatch, _worker_env, clock, where):
+    refusal = gateway_client.GatewayRPCError("claim_mismatch")
+    owner = (_Owner(submits=[refusal]) if where == "kanban.run"
+             else _Owner(receipts=["pending", refusal]))
 
-    with pytest.raises(gateway_client.GatewayRPCError):
-        await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db"))
+    with pytest.raises(gateway_client.GatewayRPCError, match="claim_mismatch"):
+        await _run(owner, monkeypatch, _worker_env)
     assert owner.dials == 1
 
 
 @pytest.mark.asyncio
-async def test_a_gateway_that_never_comes_back_fails_honestly(monkeypatch, _worker_env):
-    owner = _Owner(connects=[None, gateway_client.GatewayUnavailableError("no owner", "inaccessible")],
-                   receipts=["pending", _disconnect()])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+async def test_a_later_loss_gets_a_fresh_budget_from_the_owners_last_answer(monkeypatch, _worker_env, clock):
+    def silent_then_lost():
+        clock.now += kanban_worker_client.OWNER_WAIT_S - 10
+        return _disconnect()
 
-    with pytest.raises(gateway_client.GatewayClientError):
-        await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db"))
-
-
-class _Clock:
-    def __init__(self, values):
-        self.values = iter(values)
-        self.last = values[-1]
-
-    def monotonic(self):
-        try:
-            self.last = next(self.values)
-        except StopIteration:
-            pass
-        return self.last
-
-
-@pytest.mark.asyncio
-async def test_reconnect_starting_uses_redial_deadline_not_initial_deadline(monkeypatch, _worker_env):
-    # Initial wait expires at t=180, but the admitted attempt's redial budget runs until t=361.
-    monkeypatch.setattr(kanban_worker_client, "time", _Clock([0, 181, 181, 200]))
-    owner = _Owner(
-        connects=[None, gateway_client.GatewayUnavailableError("owner starting", "starting"), None],
-        receipts=["pending", _disconnect(), "terminal"],
-    )
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
-
-    assert await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db")) == 0
-    assert owner.calls.count("kanban.run") == 1
-    assert owner.dials == 3
-
-
-@pytest.mark.asyncio
-async def test_a_later_disconnect_gets_a_fresh_redial_budget(monkeypatch, _worker_env):
-    # The second disconnect occurs at t=200, beyond the first episode's t=190 deadline.
-    monkeypatch.setattr(kanban_worker_client, "time", _Clock([0, 10, 10, 200, 200]))
-    owner = _Owner(
-        connects=[None, None, None],
-        receipts=["pending", _disconnect(), "pending", _disconnect(), "terminal"],
-    )
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
-
-    assert await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db")) == 0
-    assert owner.calls.count("kanban.run") == 1
-    assert owner.dials == 3
-
-
-@pytest.mark.asyncio
-async def test_repeated_receipt_disconnects_cannot_reset_the_redial_budget(monkeypatch, _worker_env):
-    # Every dial succeeds, but receipt reads disconnect. Advancing monotonic time
-    # by 100 seconds per check must exhaust one recovery budget rather than reset it.
-    monkeypatch.setattr(kanban_worker_client, "time", _Clock([0, 100, 200, 300, 400]))
+    # Each loss comes 170 s after the last answer; across both, far more than OWNER_WAIT_S passes.
     owner = _Owner(connects=[None, None, None],
-                   receipts=[_disconnect(), _disconnect(), _disconnect()])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+                   receipts=["pending", silent_then_lost, "pending", silent_then_lost, "terminal"])
 
-    with pytest.raises(gateway_client.GatewayClientError, match="after admission"):
-        await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db"))
-    assert owner.calls.count("kanban.run") == 1
-    assert owner.dials == 2
+    assert await _run(owner, monkeypatch, _worker_env) == 0
+    assert owner.dials == 3 and owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio
-async def test_the_redial_budget_bounds_a_flapping_gateway(monkeypatch, _worker_env):
-    monkeypatch.setattr(kanban_worker_client, "OWNER_WAIT_S", 0.0)
-    owner = _Owner(connects=[None, None], receipts=["pending", _disconnect(), "terminal"])
-    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock):
+    owner = _Owner(connects=[None], receipts=["pending", _disconnect()], refuse_dials_after=True)
 
-    with pytest.raises(gateway_client.GatewayClientError):
-        await kanban_worker_client.run({"task_id": "t1"}, str(_worker_env / "kanban.db"))
-    assert owner.calls.count("kanban.run") == 1
+    with pytest.raises(gateway_client.GatewayClientError, match="unreachable for 180s"):
+        await _run(owner, monkeypatch, _worker_env)
+    assert clock.now >= kanban_worker_client.OWNER_WAIT_S
+    # Jittered exponential backoff (capped at 8-12 s) between dials, not one dial a second.
+    assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
